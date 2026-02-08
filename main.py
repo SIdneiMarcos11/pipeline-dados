@@ -7,13 +7,23 @@ from google.oauth2.service_account import Credentials
 
 SHEET_ID = os.environ["SHEET_ID"]
 
-def fetch_data():
-    url = "https://api.publicapis.org/entries"
-    response = requests.get(url)
-    data = response.json()["entries"][:20]
-    df = pd.DataFrame(data)
-    df["ingested_at"] = pd.Timestamp.utcnow()
+def fetch_data() -> pd.DataFrame:
+    # PTAX - Dólar comercial (Banco Central do Brasil)
+    url = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao='02-06-2026'&$format=json"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+
+    j = r.json()
+    valores = j.get("value", [])
+    df = pd.DataFrame(valores)
+
+    # Se vier vazio (fim de semana/feriado), ainda grava uma linha de controle
+    if df.empty:
+        df = pd.DataFrame([{"mensagem": "sem_cotacao_no_dia"}])
+
+    df["ingested_at"] = pd.Timestamp.utcnow().isoformat()
     return df
+
 
 def write_to_gsheet(df):
     creds_json = json.loads(os.environ["GSHEET_CREDS_JSON"])
