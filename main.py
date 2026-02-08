@@ -10,23 +10,19 @@ from google.oauth2.service_account import Credentials
 SHEET_ID = os.environ["SHEET_ID"]
 WORKSHEET = os.getenv("WORKSHEET", "bcb_long")
 
-# Limites para não crescer (seguro pro Sheets/PowerBI)
-DAYS_BACK_DAILY = 365      # selic (diário)
-MONTHS_BACK_MONTHLY = 36   # séries mensais (~36 pontos)
+DAYS_BACK_DAILY = 365
+MONTHS_BACK_MONTHLY = 36
 
 SERIES = [
-    # SELIC (D)
-    {"series_id": 11,    "metric": "selic",          "segment": "Total", "freq": "D"},
+    {"series_id": 11, "metric": "selic", "segment": "Total", "freq": "D"},
 
-    # Saldo de crédito (M)
-    {"series_id": 20539, "metric": "saldo_credito",  "segment": "Total", "freq": "M"},
-    {"series_id": 20541, "metric": "saldo_credito",  "segment": "PF",    "freq": "M"},
-    {"series_id": 20540, "metric": "saldo_credito",  "segment": "PJ",    "freq": "M"},
+    {"series_id": 20539, "metric": "saldo_credito", "segment": "Total", "freq": "M"},
+    {"series_id": 20541, "metric": "saldo_credito", "segment": "PF", "freq": "M"},
+    {"series_id": 20540, "metric": "saldo_credito", "segment": "PJ", "freq": "M"},
 
-    # Inadimplência (M)
-    {"series_id": 21082, "metric": "inadimplencia",  "segment": "Total", "freq": "M"},
-    {"series_id": 21084, "metric": "inadimplencia",  "segment": "PF",    "freq": "M"},
-    {"series_id": 21083, "metric": "inadimplencia",  "segment": "PJ",    "freq": "M"},
+    {"series_id": 21082, "metric": "inadimplencia", "segment": "Total", "freq": "M"},
+    {"series_id": 21084, "metric": "inadimplencia", "segment": "PF", "freq": "M"},
+    {"series_id": 21083, "metric": "inadimplencia", "segment": "PJ", "freq": "M"},
 ]
 
 def _br_ddmmyyyy(d: date) -> str:
@@ -50,15 +46,13 @@ def fetch_sgs(series_id: int, start: date, end: date) -> pd.DataFrame:
     return df[["date", "value"]].sort_values("date")
 
 def build_dataset() -> pd.DataFrame:
-    today = date.today()
-    end_d1 = today - timedelta(days=1)
+    end_d1 = date.today() - timedelta(days=1)
 
     frames = []
     for s in SERIES:
         if s["freq"] == "D":
             start = end_d1 - timedelta(days=DAYS_BACK_DAILY)
         else:
-            # ~36 meses -> aproxima por dias (suficiente e simples)
             start = end_d1 - timedelta(days=MONTHS_BACK_MONTHLY * 31)
 
         df = fetch_sgs(s["series_id"], start, end_d1)
@@ -72,15 +66,16 @@ def build_dataset() -> pd.DataFrame:
         out["freq"] = s["freq"]
         frames.append(out)
 
-    final = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["date", "metric", "segment", "series_id", "value", "freq"]
+    final = (
+        pd.concat(frames, ignore_index=True)
+        if frames
+        else pd.DataFrame(columns=["date", "metric", "segment", "series_id", "value", "freq"])
     )
 
     final["date"] = pd.to_datetime(final["date"]).dt.strftime("%Y-%m-%d")
     final["ingested_at"] = pd.Timestamp.utcnow().isoformat()
-
-    # Ordena e garante tamanho controlado
     final = final.sort_values(["metric", "segment", "date"]).reset_index(drop=True)
+
     return final[["date", "metric", "segment", "series_id", "value", "freq", "ingested_at"]]
 
 def write_to_gsheet(df: pd.DataFrame) -> None:
@@ -92,3 +87,16 @@ def write_to_gsheet(df: pd.DataFrame) -> None:
     sh = gc.open_by_key(SHEET_ID)
 
     try:
+        ws = sh.worksheet(WORKSHEET)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=WORKSHEET, rows=6000, cols=20)
+
+    ws.clear()
+    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
+
+def main():
+    df = build_dataset()
+    write_to_gsheet(df)
+
+if __name__ == "__main__":
+    main()
