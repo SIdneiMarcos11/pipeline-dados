@@ -8,13 +8,26 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 SHEET_ID = os.environ["SHEET_ID"]
-WORKSHEET = os.getenv("WORKSHEET", "bcb_d1")
+WORKSHEET = os.getenv("WORKSHEET", "bcb_long")
 
-# BCB/SGS (Selic diária = 11 | Meta Selic = 432)
-SGS_SELIC_DIA = 11
-SGS_META_SELIC = 432
+# Limites para não crescer (seguro pro Sheets/PowerBI)
+DAYS_BACK_DAILY = 365      # selic (diário)
+MONTHS_BACK_MONTHLY = 36   # séries mensais (~36 pontos)
 
-DAYS_BACK = 90  # limita o tamanho (sempre pequeno)
+SERIES = [
+    # SELIC (D)
+    {"series_id": 11,    "metric": "selic",          "segment": "Total", "freq": "D"},
+
+    # Saldo de crédito (M)
+    {"series_id": 20539, "metric": "saldo_credito",  "segment": "Total", "freq": "M"},
+    {"series_id": 20541, "metric": "saldo_credito",  "segment": "PF",    "freq": "M"},
+    {"series_id": 20540, "metric": "saldo_credito",  "segment": "PJ",    "freq": "M"},
+
+    # Inadimplência (M)
+    {"series_id": 21082, "metric": "inadimplencia",  "segment": "Total", "freq": "M"},
+    {"series_id": 21084, "metric": "inadimplencia",  "segment": "PF",    "freq": "M"},
+    {"series_id": 21083, "metric": "inadimplencia",  "segment": "PJ",    "freq": "M"},
+]
 
 def _br_ddmmyyyy(d: date) -> str:
     return d.strftime("%d/%m/%Y")
@@ -27,27 +40,48 @@ def fetch_sgs(series_id: int, start: date, end: date) -> pd.DataFrame:
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     data = r.json()
+
     df = pd.DataFrame(data)
     if df.empty:
         return pd.DataFrame(columns=["date", "value"])
+
     df["date"] = pd.to_datetime(df["data"], dayfirst=True).dt.date
     df["value"] = df["valor"].astype(str).str.replace(",", ".", regex=False).astype(float)
     return df[["date", "value"]].sort_values("date")
 
 def build_dataset() -> pd.DataFrame:
-    end = date.today() - timedelta(days=1)        # D-1
-    start = end - timedelta(days=DAYS_BACK)
+    today = date.today()
+    end_d1 = today - timedelta(days=1)
 
-    selic = fetch_sgs(SGS_SELIC_DIA, start, end).rename(columns={"value": "selic_pct_dia"})
-    meta  = fetch_sgs(SGS_META_SELIC, start, end).rename(columns={"value": "selic_meta"})
+    frames = []
+    for s in SERIES:
+        if s["freq"] == "D":
+            start = end_d1 - timedelta(days=DAYS_BACK_DAILY)
+        else:
+            # ~36 meses -> aproxima por dias (suficiente e simples)
+            start = end_d1 - timedelta(days=MONTHS_BACK_MONTHLY * 31)
 
-    # junta por data; meta pode não existir todos os dias -> forward fill
-    df = pd.merge(selic, meta, on="date", how="left").sort_values("date")
-    df["selic_meta"] = df["selic_meta"].ffill()
+        df = fetch_sgs(s["series_id"], start, end_d1)
+        if df.empty:
+            continue
 
-    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    df["ingested_at"] = pd.Timestamp.utcnow().isoformat()
-    return df
+        out = df.copy()
+        out["metric"] = s["metric"]
+        out["segment"] = s["segment"]
+        out["series_id"] = s["series_id"]
+        out["freq"] = s["freq"]
+        frames.append(out)
+
+    final = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["date", "metric", "segment", "series_id", "value", "freq"]
+    )
+
+    final["date"] = pd.to_datetime(final["date"]).dt.strftime("%Y-%m-%d")
+    final["ingested_at"] = pd.Timestamp.utcnow().isoformat()
+
+    # Ordena e garante tamanho controlado
+    final = final.sort_values(["metric", "segment", "date"]).reset_index(drop=True)
+    return final[["date", "metric", "segment", "series_id", "value", "freq", "ingested_at"]]
 
 def write_to_gsheet(df: pd.DataFrame) -> None:
     creds_json = json.loads(os.environ["GSHEET_CREDS_JSON"])
@@ -58,16 +92,3 @@ def write_to_gsheet(df: pd.DataFrame) -> None:
     sh = gc.open_by_key(SHEET_ID)
 
     try:
-        ws = sh.worksheet(WORKSHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET, rows=2000, cols=20)
-
-    ws.clear()
-    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
-
-def main():
-    df = build_dataset()
-    write_to_gsheet(df)
-
-if __name__ == "__main__":
-    main()
