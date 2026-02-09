@@ -14,7 +14,11 @@ DAYS_BACK_DAILY = 365
 MONTHS_BACK_MONTHLY = 36
 
 SERIES = [
+    # Selic efetiva diária (como está hoje)
     {"series_id": 11, "metric": "selic", "segment": "Total", "freq": "D"},
+
+    # ✅ NOVO: Meta Selic (% a.a.) — padronizada para mensal (M) para casar com as séries mensais
+    {"series_id": 432, "metric": "selic_meta", "segment": "Total", "freq": "M"},
 
     {"series_id": 20539, "metric": "saldo_credito", "segment": "Total", "freq": "M"},
     {"series_id": 20541, "metric": "saldo_credito", "segment": "PF", "freq": "M"},
@@ -41,9 +45,32 @@ def fetch_sgs(series_id: int, start: date, end: date) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["date", "value"])
 
-    df["date"] = pd.to_datetime(df["data"], dayfirst=True).dt.date
+    df["date"] = pd.to_datetime(df["data"], dayfirst=True)
     df["value"] = df["valor"].astype(str).str.replace(",", ".", regex=False).astype(float)
     return df[["date", "value"]].sort_values("date")
+
+def _to_monthly_ffill(df: pd.DataFrame, end_d1: date) -> pd.DataFrame:
+    """
+    Converte uma série com datas irregulares (ex.: meta Selic muda em datas específicas)
+    em série mensal (1 linha por mês), preenchendo com o último valor conhecido.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["date", "value"])
+
+    ts = df.copy()
+    ts["date"] = pd.to_datetime(ts["date"])
+    ts = ts.set_index("date").sort_index()
+
+    # Cria índice mensal do 1º dia de cada mês
+    start_month = ts.index.min().to_period("M").to_timestamp()
+    end_month = pd.Timestamp(end_d1).to_period("M").to_timestamp()
+    monthly_idx = pd.date_range(start=start_month, end=end_month, freq="MS")
+
+    # Reindex + forward fill
+    out = ts.reindex(ts.index.union(monthly_idx)).sort_index().ffill()
+    out = out.loc[monthly_idx].reset_index().rename(columns={"index": "date"})
+    out["date"] = out["date"].dt.date
+    return out[["date", "value"]]
 
 def build_dataset() -> pd.DataFrame:
     end_d1 = date.today() - timedelta(days=1)
@@ -58,6 +85,10 @@ def build_dataset() -> pd.DataFrame:
         df = fetch_sgs(s["series_id"], start, end_d1)
         if df.empty:
             continue
+
+        # ✅ Tratamento especial: Meta Selic (432) → mensal por ffill
+        if s["metric"] == "selic_meta" and s["freq"] == "M":
+            df = _to_monthly_ffill(df, end_d1)
 
         out = df.copy()
         out["metric"] = s["metric"]
