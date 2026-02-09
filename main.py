@@ -14,11 +14,7 @@ DAYS_BACK_DAILY = 365
 MONTHS_BACK_MONTHLY = 36
 
 SERIES = [
-    # Selic efetiva diária (como está hoje)
     {"series_id": 11, "metric": "selic", "segment": "Total", "freq": "D"},
-
-    # ✅ NOVO: Meta Selic (% a.a.) — padronizada para mensal (M) para casar com as séries mensais
-    {"series_id": 432, "metric": "selic_meta", "segment": "Total", "freq": "M"},
 
     {"series_id": 20539, "metric": "saldo_credito", "segment": "Total", "freq": "M"},
     {"series_id": 20541, "metric": "saldo_credito", "segment": "PF", "freq": "M"},
@@ -27,10 +23,16 @@ SERIES = [
     {"series_id": 21082, "metric": "inadimplencia", "segment": "Total", "freq": "M"},
     {"series_id": 21084, "metric": "inadimplencia", "segment": "PF", "freq": "M"},
     {"series_id": 21083, "metric": "inadimplencia", "segment": "PJ", "freq": "M"},
+
+    # Meta anual da SELIC (BCB/SGS: 432) - frequência diária/mensal varia na consulta,
+    # mas vamos tratar como "M" no dataset (é uma meta/valor de referência).
+    {"series_id": 432, "metric": "selic_meta", "segment": "Total", "freq": "M"},
 ]
+
 
 def _br_ddmmyyyy(d: date) -> str:
     return d.strftime("%d/%m/%Y")
+
 
 def fetch_sgs(series_id: int, start: date, end: date) -> pd.DataFrame:
     url = (
@@ -45,32 +47,14 @@ def fetch_sgs(series_id: int, start: date, end: date) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["date", "value"])
 
-    df["date"] = pd.to_datetime(df["data"], dayfirst=True)
+    df["date"] = pd.to_datetime(df["data"], dayfirst=True).dt.date
     df["value"] = df["valor"].astype(str).str.replace(",", ".", regex=False).astype(float)
+
+    # Proteção extra: remove linhas sem data/valor
+    df = df.dropna(subset=["date", "value"])
+
     return df[["date", "value"]].sort_values("date")
 
-def _to_monthly_ffill(df: pd.DataFrame, end_d1: date) -> pd.DataFrame:
-    """
-    Converte uma série com datas irregulares (ex.: meta Selic muda em datas específicas)
-    em série mensal (1 linha por mês), preenchendo com o último valor conhecido.
-    """
-    if df.empty:
-        return pd.DataFrame(columns=["date", "value"])
-
-    ts = df.copy()
-    ts["date"] = pd.to_datetime(ts["date"])
-    ts = ts.set_index("date").sort_index()
-
-    # Cria índice mensal do 1º dia de cada mês
-    start_month = ts.index.min().to_period("M").to_timestamp()
-    end_month = pd.Timestamp(end_d1).to_period("M").to_timestamp()
-    monthly_idx = pd.date_range(start=start_month, end=end_month, freq="MS")
-
-    # Reindex + forward fill
-    out = ts.reindex(ts.index.union(monthly_idx)).sort_index().ffill()
-    out = out.loc[monthly_idx].reset_index().rename(columns={"index": "date"})
-    out["date"] = out["date"].dt.date
-    return out[["date", "value"]]
 
 def build_dataset() -> pd.DataFrame:
     end_d1 = date.today() - timedelta(days=1)
@@ -86,10 +70,6 @@ def build_dataset() -> pd.DataFrame:
         if df.empty:
             continue
 
-        # ✅ Tratamento especial: Meta Selic (432) → mensal por ffill
-        if s["metric"] == "selic_meta" and s["freq"] == "M":
-            df = _to_monthly_ffill(df, end_d1)
-
         out = df.copy()
         out["metric"] = s["metric"]
         out["segment"] = s["segment"]
@@ -103,11 +83,18 @@ def build_dataset() -> pd.DataFrame:
         else pd.DataFrame(columns=["date", "metric", "segment", "series_id", "value", "freq"])
     )
 
+    # Normaliza formato da data e insere timestamp de carga
     final["date"] = pd.to_datetime(final["date"]).dt.strftime("%Y-%m-%d")
     final["ingested_at"] = pd.Timestamp.utcnow().isoformat()
     final = final.sort_values(["metric", "segment", "date"]).reset_index(drop=True)
 
+    # 🔒 MUITO IMPORTANTE: Sanitização para evitar erro JSON do gspread
+    # (NaN/inf não são compatíveis com JSON)
+    final = final.replace([float("inf"), float("-inf")], None)
+    final = final.where(pd.notnull(final), None)
+
     return final[["date", "metric", "segment", "series_id", "value", "freq", "ingested_at"]]
+
 
 def write_to_gsheet(df: pd.DataFrame) -> None:
     creds_json = json.loads(os.environ["GSHEET_CREDS_JSON"])
@@ -123,11 +110,19 @@ def write_to_gsheet(df: pd.DataFrame) -> None:
         ws = sh.add_worksheet(title=WORKSHEET, rows=6000, cols=20)
 
     ws.clear()
-    ws.update([df.columns.tolist()] + df.astype(str).values.tolist())
+
+    # Evita qualquer resquício de NaN/inf no momento de escrever
+    safe_df = df.copy()
+    safe_df = safe_df.replace([float("inf"), float("-inf")], None)
+    safe_df = safe_df.where(pd.notnull(safe_df), None)
+
+    ws.update([safe_df.columns.tolist()] + safe_df.astype(str).values.tolist())
+
 
 def main():
     df = build_dataset()
     write_to_gsheet(df)
+
 
 if __name__ == "__main__":
     main()
