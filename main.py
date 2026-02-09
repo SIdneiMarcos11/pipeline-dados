@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from datetime import date, timedelta
 
 import pandas as pd
@@ -13,6 +14,10 @@ WORKSHEET = os.getenv("WORKSHEET", "bcb_long")
 DAYS_BACK_DAILY = 365
 MONTHS_BACK_MONTHLY = 36
 
+# Retry settings (SGS/BCB instável às vezes)
+SGS_MAX_RETRIES = int(os.getenv("SGS_MAX_RETRIES", "10"))
+SGS_TIMEOUT_SEC = int(os.getenv("SGS_TIMEOUT_SEC", "30"))
+
 SERIES = [
     {"series_id": 11, "metric": "selic", "segment": "Total", "freq": "D"},
 
@@ -24,8 +29,7 @@ SERIES = [
     {"series_id": 21084, "metric": "inadimplencia", "segment": "PF", "freq": "M"},
     {"series_id": 21083, "metric": "inadimplencia", "segment": "PJ", "freq": "M"},
 
-    # Meta anual da SELIC (BCB/SGS: 432) - frequência diária/mensal varia na consulta,
-    # mas vamos tratar como "M" no dataset (é uma meta/valor de referência).
+    # Meta anual da SELIC (BCB/SGS: 432)
     {"series_id": 432, "metric": "selic_meta", "segment": "Total", "freq": "M"},
 ]
 
@@ -34,26 +38,96 @@ def _br_ddmmyyyy(d: date) -> str:
     return d.strftime("%d/%m/%Y")
 
 
+def _sleep_backoff(attempt: int) -> None:
+    """
+    Backoff exponencial com jitter simples.
+    attempt começa em 1.
+    """
+    # 1,2,4,8,16,20,20...
+    wait = min(2 ** (attempt - 1), 20)
+    # jitter leve (0 a 0.5s) pra não bater igual sempre
+    wait = wait + (attempt * 0.05)
+    time.sleep(wait)
+
+
 def fetch_sgs(series_id: int, start: date, end: date) -> pd.DataFrame:
-    url = (
-        f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
-        f"?formato=json&dataInicial={_br_ddmmyyyy(start)}&dataFinal={_br_ddmmyyyy(end)}"
-    )
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
+    params = {
+        "formato": "json",
+        "dataInicial": _br_ddmmyyyy(start),
+        "dataFinal": _br_ddmmyyyy(end),
+    }
+    headers = {"Accept": "application/json"}
 
-    df = pd.DataFrame(data)
-    if df.empty:
-        return pd.DataFrame(columns=["date", "value"])
+    last_err = None
 
-    df["date"] = pd.to_datetime(df["data"], dayfirst=True).dt.date
-    df["value"] = df["valor"].astype(str).str.replace(",", ".", regex=False).astype(float)
+    for attempt in range(1, SGS_MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=SGS_TIMEOUT_SEC)
 
-    # Proteção extra: remove linhas sem data/valor
-    df = df.dropna(subset=["date", "value"])
+            status = r.status_code
+            body = (r.text or "").strip()
+            ctype = (r.headers.get("content-type") or "").lower()
 
-    return df[["date", "value"]].sort_values("date")
+            # Caso OK + corpo não vazio -> tenta JSON
+            if status == 200 and body:
+                # Se retornou HTML ou algo estranho, trata como falha transitória
+                if "text/html" in ctype or body.startswith("<"):
+                    raise RuntimeError(
+                        f"SGS 200 mas retornou HTML (provável instabilidade). "
+                        f"series={series_id} ctype={ctype} preview={body[:120]!r}"
+                    )
+
+                try:
+                    data = r.json()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"SGS retornou 200 mas não era JSON. series={series_id} "
+                        f"ctype={ctype} preview={body[:120]!r}"
+                    ) from e
+
+                df = pd.DataFrame(data)
+                if df.empty:
+                    # vazio também pode ser transitório; tenta de novo algumas vezes
+                    raise RuntimeError(f"SGS retornou JSON vazio. series={series_id}")
+
+                # Normalização
+                df["date"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce").dt.date
+                df["value"] = (
+                    df["valor"]
+                    .astype(str)
+                    .str.replace(",", ".", regex=False)
+                    .replace("None", "")
+                )
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
+
+                df = df.dropna(subset=["date", "value"])
+                return df[["date", "value"]].sort_values("date")
+
+            # Retentativas para instabilidade / rate limit
+            if status in (429, 500, 502, 503, 504) or not body:
+                last_err = RuntimeError(
+                    f"SGS falha transitória. series={series_id} status={status} "
+                    f"ctype={ctype} preview={body[:120]!r} (tentativa {attempt}/{SGS_MAX_RETRIES})"
+                )
+                print(f"[WARN] {last_err}")
+                _sleep_backoff(attempt)
+                continue
+
+            # Erros definitivos (4xx comuns)
+            r.raise_for_status()
+
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] fetch_sgs erro series={series_id} (tentativa {attempt}/{SGS_MAX_RETRIES}): {e}")
+            if attempt < SGS_MAX_RETRIES:
+                _sleep_backoff(attempt)
+            else:
+                break
+
+    # Se estourou as tentativas, devolve DF vazio (pra não derrubar o pipeline todo)
+    print(f"[ERROR] SGS indisponível para series={series_id} após {SGS_MAX_RETRIES} tentativas. Erro final: {last_err}")
+    return pd.DataFrame(columns=["date", "value"])
 
 
 def build_dataset() -> pd.DataFrame:
@@ -68,6 +142,7 @@ def build_dataset() -> pd.DataFrame:
 
         df = fetch_sgs(s["series_id"], start, end_d1)
         if df.empty:
+            # não derruba: apenas segue
             continue
 
         out = df.copy()
@@ -84,12 +159,13 @@ def build_dataset() -> pd.DataFrame:
     )
 
     # Normaliza formato da data e insere timestamp de carga
-    final["date"] = pd.to_datetime(final["date"]).dt.strftime("%Y-%m-%d")
+    final["date"] = pd.to_datetime(final["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     final["ingested_at"] = pd.Timestamp.utcnow().isoformat()
+
+    final = final.dropna(subset=["date"])
     final = final.sort_values(["metric", "segment", "date"]).reset_index(drop=True)
 
-    # 🔒 MUITO IMPORTANTE: Sanitização para evitar erro JSON do gspread
-    # (NaN/inf não são compatíveis com JSON)
+    # Sanitização: remove NaN/inf (gspread/JSON não aceitam)
     final = final.replace([float("inf"), float("-inf")], None)
     final = final.where(pd.notnull(final), None)
 
@@ -111,12 +187,13 @@ def write_to_gsheet(df: pd.DataFrame) -> None:
 
     ws.clear()
 
-    # Evita qualquer resquício de NaN/inf no momento de escrever
     safe_df = df.copy()
     safe_df = safe_df.replace([float("inf"), float("-inf")], None)
     safe_df = safe_df.where(pd.notnull(safe_df), None)
 
-    ws.update([safe_df.columns.tolist()] + safe_df.astype(str).values.tolist())
+    # Importante: não forçar .astype(str) (isso vira "None" em texto)
+    values = [safe_df.columns.tolist()] + safe_df.values.tolist()
+    ws.update(values)
 
 
 def main():
